@@ -1,0 +1,11 @@
+# Prompt del proyecto
+
+Construye y prueba una aplicación de escritorio instalable para Windows 10/11 que reciba libros PDF, normalmente de hasta 1000 páginas, y genere contenido limpio para consultarlo después en Claude, Gemini o ChatGPT con menos tokens que el PDF original. No impongas Markdown como único formato por principio; usa texto estructurado como salida principal y anexos visuales cuando hagan falta.
+
+La aplicación debe tener una cola persistente. Permite agregar PDFs mientras convierte otro, ver el progreso, pausar, cancelar y reintentar. Tras cerrar y abrir la aplicación, reanuda los trabajos desde la última página terminada. Procesa páginas por lotes para limitar el uso de memoria. Todo funciona localmente, sin enviar libros a servicios externos ni requerir claves de API.
+
+Extrae texto de PDFs digitales y aplica OCR selectivo a páginas escaneadas en español e inglés. Limpia encabezados repetidos, marcas de agua textuales y cortes de palabra cuando se pueda verificar; conserva capítulos, tablas, páginas de origen y fórmulas con su texto original. Si una fórmula no puede interpretarse de manera fiable, conserva su representación visual y señálala para revisión; no inventes LaTeX ni datos de gráficos.
+
+Exporta **todos los archivos finales en una sola carpeta de salida**, sin subcarpetas. Produce un índice por libro, partes de texto de tamaño configurable, imágenes PNG de contenido visual y anexos PDF de figuras para adjuntar solo cuando se necesiten. Cada imagen debe estar identificada en su nombre y en el texto como `Imagen N (Nombre del libro o PDF)`, por ejemplo `Imagen 1 (Gudmundsson)`. El identificador debe terminar con el nombre completo del PDF sin extensión. Evita colisiones entre libros homónimos de diferentes rutas. Conserva en el índice el origen, la página y el orden de lectura.
+
+Entrega el código fuente, un proyecto que pueda compilarse como ejecutable o instalador de Windows, instrucciones simples y pruebas reales de texto, OCR, imágenes, cola persistente y reanudación. Si no puedes compilar Windows desde tu entorno, no afirmes que ya existe un instalador: proporciona una receta automatizada para compilarlo en Windows e indica lo que probaste y las limitaciones conocidas.
