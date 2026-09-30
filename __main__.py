@@ -9,11 +9,16 @@ def main(argv=None):
     parser.add_argument("--cli", metavar="PDF", help="Convertir sin abrir la interfaz")
     parser.add_argument("--output", help="Carpeta única de salida")
     parser.add_argument("--lang", default="spa+eng", help="Idiomas de OCR")
-    parser.add_argument("--max-pages", type=int, default=40)
+    parser.add_argument("--max-pages", type=int, default=200, help="Páginas por parte (1-2000)")
     parser.add_argument("--selftest", action="store_true", help="Autodiagnóstico del paquete")
     parser.add_argument("--gui", action="store_true", help="Con --selftest, prueba también la ventana")
     parser.add_argument("--report", help="Con --selftest o --cli, guarda el resultado en este archivo JSON")
     args = parser.parse_args(argv)
+    if sys.stdout is None or sys.stderr is None:   # ejecutable sin consola (--noconsole)
+        import os
+        sink = open(os.devnull, "w", encoding="utf-8")
+        sys.stdout = sys.stdout or sink
+        sys.stderr = sys.stderr or sink
     if args.selftest:
         from pathlib import Path
         from .selftest import run

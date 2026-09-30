@@ -1,30 +1,37 @@
-# Lector PDF para IA — versión 0.1.1
+# Lector PDF para IA — versión 0.3.0
 
-Convierte libros PDF en texto por partes y anexos visuales. Todo se exporta en **una sola carpeta**. Cada figura lleva el identificador `Imagen N (Nombre del PDF)`; su archivo tiene además un prefijo único para evitar colisiones entre dos PDFs homónimos de distintas carpetas.
+Convierte libros PDF en texto Markdown compacto para consultarlos con Claude, Gemini, ChatGPT o NotebookLM. Todo se procesa en el equipo, sin conexión ni claves de API.
 
 ## Qué produce
 
-Para `Gudmundsson.pdf`, crea `Gudmundsson__<id>__INDICE.md`, partes `Gudmundsson__<id>__parte_001.md`, imágenes `<id>__Imagen 0001 (Gudmundsson).png` y anexos `Gudmundsson__<id>__figuras_001.pdf`. Los enlaces entre esos archivos funcionan dentro de la misma carpeta. Cada imagen está identificada en el texto y conserva el número de página. Una página escaneada se conserva íntegra como imagen, además de aplicar OCR.
+Cada libro se exporta en su propia carpeta dentro de la carpeta de salida elegida:
 
-**Uso con Claude:** sube primero el índice y las partes de texto que necesites. Cuando necesites analizar gráficas, adjunta el anexo visual de ese libro. El enlace a un PNG en el Markdown no hace que Claude reciba el PNG automáticamente. El anexo se divide por un máximo de 60 imágenes y un límite aproximado de 19 MB de datos de imagen por archivo; si excede los límites de tamaño de tu servicio, sube imágenes específicas.
+    Libros para IA/
+      <Libro>/
+        <Libro> - COMPLETO.md        texto completo (archivo principal)
+        <Libro>.pdf                  copia del PDF original
+        <Libro> - figuras 001.pdf    anexo con todas las imágenes, para adjuntar a la IA
+        imagenes/Imagen 0001 (<Libro>).png
+        partes/<Libro> - parte 001.md
 
-La extracción de fórmulas, tablas y orden de lectura depende de la calidad del PDF. El OCR no interpreta con garantías las ecuaciones; el anexo visual permite verificarlas. La detección de dibujos vectoriales es aproximada y puede incluir tablas o pasar por alto gráficas pequeñas. El programa no resume ni inventa contenido.
-Las páginas con símbolos matemáticos reconocibles se conservan íntegras en el anexo para cotejar la transcripción. Las fórmulas no se convierten automáticamente a LaTeX en esta versión.
+El archivo COMPLETO empieza con un resumen y un índice de títulos con su página. Las ecuaciones de display de PDF digitales se convierten a LaTeX (`$$...$$`, con `\tag{}` para su número); cada resultado se valida contra los caracteres del PDF y, si no coincide, se adjunta la imagen de la ecuación con la marca `[verificar fórmula]`. Superíndices y subíndices se marcan como `^{}` y `_{}`. `[p. N]` marca el inicio de la página N del PDF. Las tablas con líneas se transcriben como tablas Markdown y además se conservan como imagen. Los diagramas se guardan como imagen con su texto resumido en una línea ("Texto en la figura: …"). Se eliminan encabezados y pies repetidos, folios, capas de texto duplicadas y cortes de línea dentro de los párrafos. Las páginas escaneadas pasan por OCR (español e inglés) y se conservan íntegras como imagen.
 
-## Crear el instalador y la versión portable
+## Uso con IA
 
-Opción sin instalar nada en tu equipo: sube este proyecto a un repositorio de GitHub y ejecuta la acción "Compilar Windows" (archivo `.github/workflows/windows.yml`). Compila en Windows x64 real, prueba el ejecutable, el instalador instalado en silencio y la versión portable después de desinstalar Tesseract del equipo, y publica `LectorPDFIA_Instalador.exe`, `LectorPDFIA_Portable.zip` y los informes `autodiagnostico_*.json` como artefacto descargable.
+Para libros largos, carga el archivo COMPLETO en un Proyecto de Claude o en NotebookLM, que buscan dentro de documentos grandes. En un chat normal, adjunta solo las partes que necesites. Cuando la pregunta dependa de una gráfica, adjunta también el anexo de figuras.
 
-Opción en un Windows propio: instala Python 3.11+ x64, Tesseract OCR 5 x64 e Inno Setup 6, y ejecuta `powershell -ExecutionPolicy Bypass -File .\build_windows.ps1`. Los resultados quedan en `entregables`.
+## Compilar
+
+Sube los archivos a GitHub y ejecuta la acción "Compilar Windows", o en Windows ejecuta `powershell -ExecutionPolicy Bypass -File .\build_windows.ps1` con Python 3.11+, Tesseract 5 e Inno Setup 6 instalados. El resultado queda en `entregables`.
 
 ## Autodiagnóstico
 
-`LectorPDFIA.exe --selftest --gui --report informe.json` comprueba que usa el Tesseract incluido, que existen los idiomas español e inglés, convierte un PDF digital y uno escaneado, abre cada archivo exportado y abre la ventana. Código de salida 0 = correcto.
+`LectorPDFIA.exe --selftest --gui --report informe.json` comprueba el Tesseract incluido, los idiomas, la conversión de un PDF digital y uno escaneado, los archivos exportados y la ventana. Código de salida 0 = correcto.
 
 ## Línea de comandos
 
-`python -m lector_pdf_ia --cli "Libro.pdf" --output "C:\LibrosIA" --lang spa+eng --max-pages 40`
+`LectorPDFIA.exe --cli "Libro.pdf" --output "C:\LibrosIA" --lang spa+eng --max-pages 200`
 
-## Organización y recuperación
+## Límites
 
-Los archivos finales quedan planos en la carpeta elegida. La base de datos y los checkpoints internos viven en la carpeta de datos del usuario, no en la exportación. Cada página se guarda al terminarse; al completar un trabajo se crean las partes e índice. Una segunda conversión del mismo PDF reemplaza sus archivos con el mismo nombre. Si modificas el PDF de origen o cambias la carpeta o idiomas, se invalida el checkpoint y se inicia de nuevo.
+No resume ni reescribe el contenido. La conversión a LaTeX usa un modelo local (LaTeX-OCR/pix2tex, licencia MIT) y solo aplica a PDF digitales; en páginas escaneadas las fórmulas quedan en la imagen de la página. Ecuaciones matriciales, sistemas de varias líneas y fórmulas muy largas pueden requerir verificación. La calidad del OCR depende del escaneo. Tablas sin líneas, texto en varias columnas y gráficas vectoriales pequeñas pueden extraerse de forma imperfecta. No abre PDF protegidos con contraseña. PyMuPDF usa licencia AGPL: si distribuyes el programa a terceros, publica el código fuente o adquiere una licencia comercial.

@@ -19,11 +19,14 @@ class JobStore:
                 id INTEGER PRIMARY KEY, source TEXT NOT NULL, output TEXT NOT NULL,
                 languages TEXT NOT NULL, state TEXT NOT NULL, current INTEGER DEFAULT 0,
                 total INTEGER DEFAULT 0, message TEXT DEFAULT '', created REAL NOT NULL,
-                max_pages INTEGER NOT NULL DEFAULT 40
+                max_pages INTEGER NOT NULL DEFAULT 200,
+                folder TEXT NOT NULL DEFAULT ''
             )""")
             columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             if "max_pages" not in columns:
-                db.execute("ALTER TABLE jobs ADD COLUMN max_pages INTEGER NOT NULL DEFAULT 40")
+                db.execute("ALTER TABLE jobs ADD COLUMN max_pages INTEGER NOT NULL DEFAULT 200")
+            if "folder" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN folder TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE jobs SET state='queued', message='Reanudado al abrir' WHERE state='running'")
 
     @contextmanager
@@ -38,7 +41,7 @@ class JobStore:
         finally:
             con.close()
 
-    def add(self, source: Path, output: Path, languages: str, max_pages: int = 40) -> int:
+    def add(self, source: Path, output: Path, languages: str, max_pages: int = 200) -> int:
         with self._db() as db:
             cur = db.execute("INSERT INTO jobs(source,output,languages,state,created,max_pages) VALUES(?,?,?,?,?,?)",
                              (str(source.resolve()), str(output.resolve()), languages, "queued", time.time(), max_pages))
@@ -57,8 +60,9 @@ class JobStore:
                 return dict(row)
         return None
 
-    def update(self, job_id: int, *, state=None, current=None, total=None, message=None):
-        values = {"state": state, "current": current, "total": total, "message": message}
+    def update(self, job_id: int, *, state=None, current=None, total=None, message=None, folder=None):
+        values = {"state": state, "current": current, "total": total, "message": message,
+                  "folder": folder}
         values = {k: v for k, v in values.items() if v is not None}
         if not values:
             return
@@ -98,7 +102,10 @@ class QueueWorker:
 
     @staticmethod
     def _summary(result: dict) -> str:
-        text = f"{result['figures']} imágenes · {result['ocr_pages']} páginas OCR"
+        text = (f"{result['figures']} imágenes · {result['tables']} tablas · "
+                f"{result.get('equations', 0)} ecuaciones · {result['ocr_pages']} págs. OCR")
+        if result.get("equations_flagged"):
+            text += f" · {result['equations_flagged']} fórmulas por verificar"
         if result.get("ocr_failed"):
             text += f" · ATENCIÓN: OCR falló en {result['ocr_failed']} página(s)"
         return text
@@ -128,7 +135,8 @@ class QueueWorker:
                 result = convert(job["source"], job["output"], languages=job["languages"],
                                  max_pages=job["max_pages"], progress=progress)
                 self.store.update(job_id, state="done", current=result["pages"],
-                                  total=result["pages"], message=self._summary(result))
+                                  total=result["pages"], message=self._summary(result),
+                                  folder=result["folder"])
             except Cancelled:
                 self.store.update(job_id, state="cancelled", message="Cancelado; puede reintentarse")
             except Shutdown:

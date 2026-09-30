@@ -1,2 +1,5 @@
 PyMuPDF>=1.24,<2
+tkinterdnd2>=0.4,<1
+onnxruntime>=1.17,<2
+numpy>=1.24,<3
 Pillow>=10,<13

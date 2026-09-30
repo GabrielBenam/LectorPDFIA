@@ -1,5 +1,5 @@
 #define AppName "Lector PDF para IA"
-#define AppVersion "0.1.1"
+#define AppVersion "0.3.0"
 [Setup]
 AppId={{9350566C-7B13-497F-969C-7BF0523397A5}
 AppName={#AppName}
@@ -18,6 +18,8 @@ MinVersion=10.0
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog commandline
 UninstallDisplayIcon={app}\LectorPDFIA.exe
+SetupIconFile=icono.ico
+CloseApplications=yes
 [Languages]
 Name: "es"; MessagesFile: "compiler:Languages\Spanish.isl"
 [Files]
