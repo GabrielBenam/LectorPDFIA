@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
@@ -216,11 +217,12 @@ class Application(tk.Tk, DnDWrapper):
 
         table_frame = ttk.Frame(queue, style="Card.TFrame")
         table_frame.pack(fill="both", expand=True)
-        cols = ("book", "state", "progress", "detail")
+        cols = ("book", "state", "progress", "time", "detail")
         self.table = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
-        for col, head, width, stretch in (("book", "PDF", 300, True), ("state", "Estado", 110, False),
-                                          ("progress", "Progreso", 150, False),
-                                          ("detail", "Detalle", 320, True)):
+        for col, head, width, stretch in (("book", "PDF", 270, True), ("state", "Estado", 105, False),
+                                          ("progress", "Progreso", 140, False),
+                                          ("time", "Tiempo", 80, False),
+                                          ("detail", "Detalle", 300, True)):
             self.table.heading(col, text=head, anchor="w")
             self.table.column(col, width=width, stretch=stretch, anchor="w")
         for state, color in STATE_COLOR.items():
@@ -340,8 +342,14 @@ class Application(tk.Tk, DnDWrapper):
             key = str(job["id"])
             pct = int(100 * job["current"] / job["total"]) if job["total"] else 0
             progress = f"{pct}%  ({job['current']}/{job['total']})" if job["total"] else "—"
+            seconds = float(job.get("elapsed") or 0)
+            if job["state"] == "running" and not self.worker.paused.is_set() and job.get("tick"):
+                seconds += max(0.0, time.time() - job["tick"])
+            clock = "—" if not seconds else (
+                f"{int(seconds // 3600)}:{int(seconds % 3600 // 60):02d}:{int(seconds % 60):02d}"
+                if seconds >= 3600 else f"{int(seconds // 60)}:{int(seconds % 60):02d} min")
             values = (Path(job["source"]).name, STATE_LABEL.get(job["state"], job["state"]),
-                      progress, job["message"])
+                      progress, clock, job["message"])
             if key in current:
                 self.table.item(key, values=values, tags=(job["state"],))
             else:
@@ -351,7 +359,8 @@ class Application(tk.Tk, DnDWrapper):
         if active:
             job, pct = active
             self.progress["value"] = pct
-            self.active_var.set(f"Convirtiendo {Path(job['source']).name[:60]} · {pct}%")
+            self.active_var.set(f"Convirtiendo {Path(job['source']).name[:55]} · {pct}% · se cancela "
+                                f"solo si a los 30 min no pasa del 10 %")
         else:
             self.progress["value"] = 0
             self.active_var.set("En pausa" if self.worker.paused.is_set() else "Sin trabajos activos")

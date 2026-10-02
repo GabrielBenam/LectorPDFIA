@@ -19,6 +19,11 @@ def main(argv=None):
         sink = open(os.devnull, "w", encoding="utf-8")
         sys.stdout = sys.stdout or sink
         sys.stderr = sys.stderr or sink
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     if args.selftest:
         from pathlib import Path
         from .selftest import run

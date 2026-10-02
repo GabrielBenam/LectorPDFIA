@@ -1,0 +1,48 @@
+# Compila y prueba Lector PDF para IA en un Windows real de GitHub (windows-2022, x64).
+# Acepta los archivos sueltos en la raíz del repositorio y los acomoda en sus carpetas.
+name: Compilar Windows
+on: [workflow_dispatch, push]
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Organizar archivos en carpetas
+        shell: pwsh
+        run: |
+          if (-not (Test-Path lector_pdf_ia)) {
+            New-Item -ItemType Directory -Force lector_pdf_ia, tests | Out-Null
+            Move-Item __init__.py, __main__.py, app.py, converter.py, jobs.py, selftest.py lector_pdf_ia
+            Move-Item test_conversion.py, test_packaging.py tests
+          }
+          Get-ChildItem -Recurse -File | Select-Object -ExpandProperty FullName
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', architecture: 'x64' }
+      - name: Herramientas de compilación
+        shell: pwsh
+        run: |
+          choco install tesseract -y --no-progress
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      - name: Compilar y probar
+        shell: pwsh
+        run: ./build_windows.ps1
+      - name: Probar sin Tesseract instalado en el equipo
+        shell: pwsh
+        run: |
+          choco uninstall tesseract -y --no-progress
+          if (Get-Command tesseract -ErrorAction SilentlyContinue) { throw 'Tesseract sigue en el PATH' }
+          Expand-Archive entregables\LectorPDFIA_Portable.zip -DestinationPath $env:RUNNER_TEMP\portable
+          $p = Start-Process "$env:RUNNER_TEMP\portable\LectorPDFIA\LectorPDFIA.exe" -ArgumentList '--selftest','--gui','--report',"$env:RUNNER_TEMP\limpio.json" -Wait -PassThru
+          Get-Content "$env:RUNNER_TEMP\limpio.json" -Encoding UTF8
+          if ($p.ExitCode -ne 0) { throw 'Autodiagnóstico falló sin Tesseract del sistema' }
+          Copy-Item "$env:RUNNER_TEMP\limpio.json" entregables\autodiagnostico_sin_tesseract.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: LectorPDFIA-Windows-x64
+          path: entregables/
+          if-no-files-found: warn

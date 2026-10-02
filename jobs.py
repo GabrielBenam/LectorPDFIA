@@ -9,6 +9,13 @@ from pathlib import Path
 
 from .converter import Cancelled, Shutdown, app_data, convert
 
+AUTO_CANCEL_SECONDS = 30 * 60      # a los 30 min de trabajo activo...
+AUTO_CANCEL_PROGRESS = .10         # ...si el avance no supera el 10 %
+
+
+class AutoCancelled(Cancelled):
+    pass
+
 
 class JobStore:
     def __init__(self, path: Path | None = None):
@@ -27,6 +34,9 @@ class JobStore:
                 db.execute("ALTER TABLE jobs ADD COLUMN max_pages INTEGER NOT NULL DEFAULT 200")
             if "folder" not in columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN folder TEXT NOT NULL DEFAULT ''")
+            if "elapsed" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN elapsed REAL NOT NULL DEFAULT 0")
+                db.execute("ALTER TABLE jobs ADD COLUMN tick REAL NOT NULL DEFAULT 0")
             db.execute("UPDATE jobs SET state='queued', message='Reanudado al abrir' WHERE state='running'")
 
     @contextmanager
@@ -60,9 +70,11 @@ class JobStore:
                 return dict(row)
         return None
 
-    def update(self, job_id: int, *, state=None, current=None, total=None, message=None, folder=None):
+    def update(self, job_id: int, *, state=None, current=None, total=None, message=None, folder=None,
+               elapsed=None):
         values = {"state": state, "current": current, "total": total, "message": message,
-                  "folder": folder}
+                  "folder": folder, "elapsed": elapsed,
+                  "tick": time.time() if elapsed is not None else None}
         values = {k: v for k, v in values.items() if v is not None}
         if not values:
             return
@@ -72,7 +84,7 @@ class JobStore:
 
     def retry(self, job_id: int) -> None:
         with self._db() as db:
-            db.execute("UPDATE jobs SET state='queued',current=0,message='' "
+            db.execute("UPDATE jobs SET state='queued',current=0,message='',elapsed=0 "
                        "WHERE id=? AND state IN ('failed','cancelled','done')", (job_id,))
 
     def cancel_pending(self, job_id: int) -> None:
@@ -103,7 +115,7 @@ class QueueWorker:
     @staticmethod
     def _summary(result: dict) -> str:
         text = (f"{result['figures']} imágenes · {result['tables']} tablas · "
-                f"{result.get('equations', 0)} ecuaciones · {result['ocr_pages']} págs. OCR")
+                f"{result.get('equations', 0)} ecuaciones LaTeX · {result['ocr_pages']} págs. OCR")
         if result.get("equations_flagged"):
             text += f" · {result['equations_flagged']} fórmulas por verificar"
         if result.get("ocr_failed"):
@@ -121,28 +133,46 @@ class QueueWorker:
                 continue
             job_id = job["id"]
             self.active_id = job_id
+            clock = {"active": float(job.get("elapsed") or 0), "last": time.monotonic()}
+            self.store.update(job_id, elapsed=clock["active"])
 
             def progress(current: int, total: int):
+                now = time.monotonic()
+                clock["active"] += now - clock["last"]
+                clock["last"] = now
+                if self.paused.is_set():
+                    self.store.update(job_id, elapsed=clock["active"])
                 while self.paused.is_set() and not self.stop.is_set() and self.cancel_id != job_id:
                     self.stop.wait(.2)
+                clock["last"] = time.monotonic()                 # la pausa no cuenta
                 if self.stop.is_set():
                     raise Shutdown()
                 if self.cancel_id == job_id:
                     raise Cancelled()
-                self.store.update(job_id, current=current, total=total)
+                if clock["active"] >= AUTO_CANCEL_SECONDS and total and \
+                        current / total <= AUTO_CANCEL_PROGRESS:
+                    raise AutoCancelled()
+                self.store.update(job_id, current=current, total=total, elapsed=clock["active"])
 
             try:
                 result = convert(job["source"], job["output"], languages=job["languages"],
                                  max_pages=job["max_pages"], progress=progress)
+                clock["active"] += time.monotonic() - clock["last"]
                 self.store.update(job_id, state="done", current=result["pages"],
                                   total=result["pages"], message=self._summary(result),
-                                  folder=result["folder"])
+                                  folder=result["folder"], elapsed=clock["active"])
+            except AutoCancelled:
+                self.store.update(job_id, state="cancelled", elapsed=clock["active"],
+                                  message=f"Cancelado automáticamente: "
+                                          f"{AUTO_CANCEL_SECONDS // 60} min con avance de "
+                                          f"{int(AUTO_CANCEL_PROGRESS * 100)} % o menos")
             except Cancelled:
                 self.store.update(job_id, state="cancelled", message="Cancelado; puede reintentarse")
             except Shutdown:
                 self.store.update(job_id, state="queued", message="Pendiente para reanudar")
             except Exception as exc:
-                self.store.update(job_id, state="failed", message=str(exc)[:500])
+                self.store.update(job_id, state="failed", message=str(exc)[:500],
+                                  elapsed=clock["active"] + time.monotonic() - clock["last"])
             finally:
                 self.active_id = None
                 self.cancel_id = None

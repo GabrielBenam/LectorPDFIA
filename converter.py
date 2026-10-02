@@ -26,7 +26,7 @@ try:  # PyMuPDF >= 1.24 expone "pymupdf"; "fitz" queda como alias obsoleto.
 except ImportError:  # pragma: no cover
     import fitz
 
-FORMAT_VERSION = 3          # invalida checkpoints de la versión anterior
+FORMAT_VERSION = 4          # invalida checkpoints de la versión anterior
 EDGE_TOP, EDGE_BOTTOM = .20, .80   # franja amplia; solo se quita lo que se repite
 NAME_CHARS = 60             # límite del nombre en archivos (rutas de Windows < 260)
 CAPTION = re.compile(r"^\s*(figura|fig\.|gr[aá]fic[oa]|tabla|cuadro|esquema|diagrama|"
@@ -40,6 +40,30 @@ class Cancelled(Exception):
 
 class Shutdown(Exception):
     pass
+
+
+class ScannedDocument(ValueError):
+    """El PDF es casi todo imagen: el OCR de todo el libro tardaría demasiado."""
+
+
+SCAN_MIN_PAGES, SCAN_RATIO = 20, .8
+
+
+def _looks_scanned(page) -> bool:
+    words = len(re.findall(r"\w", page.get_text("text")))
+    return words < 45 and _image_coverage(page) >= .5
+
+
+def check_not_scanned(doc) -> None:
+    total = len(doc)
+    if total <= SCAN_MIN_PAGES:
+        return
+    sample = sorted({int(i * (total - 1) / 29) for i in range(30)})
+    scanned = sum(_looks_scanned(doc[i]) for i in sample)
+    if scanned / len(sample) >= SCAN_RATIO:
+        raise ScannedDocument(
+            f"PDF escaneado: {round(100 * scanned / len(sample))} % de las páginas muestreadas "
+            f"no tienen texto. El OCR de {total} páginas tardaría demasiado; conversión detenida.")
 
 
 def app_data() -> Path:
@@ -214,6 +238,9 @@ def _image_coverage(page) -> float:
     return min(1.0, covered / area)
 
 
+NUMBERED_HEADING = re.compile(r"^((?:[A-Z]|\d{1,2})(?:\.\d{1,3}){0,4})\.?\s+[A-ZÁÉÍÓÚ(][^\n]{2,110}$")
+
+
 def _line_text(line, page, stats) -> str:
     """Texto de una línea con ^{superíndices}, _{subíndices} y fórmulas en línea."""
     spans = [dict(sp, text=_fix_symbol(sp["text"], sp["font"])) for sp in line["spans"] if sp["text"]]
@@ -224,13 +251,14 @@ def _line_text(line, page, stats) -> str:
     out, i = [], 0
     while i < len(spans):
         sp = spans[i]
-        if page is not None and MATH_FONT.search(sp["font"]):
+        if page is not None and _is_math_span(sp):
             j = i
-            while j < len(spans) and MATH_FONT.search(spans[j]["font"]):
+            while j < len(spans) and _is_math_span(spans[j]):
                 j += 1
             run = spans[i:j]
             raw = "".join(r["text"] for r in run)
             if raw.strip(BULLETS + " ") and any(_unreliable(r["text"], r["font"]) for r in run) \
+                    and len(raw.strip()) >= 2 \
                     and (any(TEX_FONT.search(r["font"]) for r in run) or len(raw.strip()) >= 3):
                 rect = fitz.Rect(run[0]["bbox"])
                 for r in run[1:]:
@@ -271,6 +299,13 @@ def _block_text(block: dict, height: float, repeated: set[str], body: float,
         lines.append((_line_text(line, page, stats), raw))
         sizes.extend(s["size"] for s in line["spans"] if s["text"].strip())
     text = _clean_text("\n".join(t for t, _ in lines))
+    num = NUMBERED_HEADING.match(text) if text and len(text) <= 120 else None
+    if num and "$" not in text:
+        spans = [sp for l in block["lines"] for sp in l["spans"] if sp["text"].strip()]
+        bold = bool(spans) and all(sp["flags"] & 16 or "bold" in sp["font"].lower() for sp in spans)
+        upper = sum(c.isupper() for c in text) >= .6 * max(1, sum(c.isalpha() for c in text))
+        if bold or upper or (sizes and min(sizes) >= body * 1.08):
+            return ("## " if num.group(1).count(".") <= 1 else "### ") + text
     if text and sizes and len(text) <= 150 and "$" not in text:
         ratio = min(sizes) / body
         if ratio >= 1.45:
@@ -280,22 +315,54 @@ def _block_text(block: dict, height: float, repeated: set[str], body: float,
     return text
 
 
-def _visual_regions(page, drawings: bool = True) -> list[tuple[fitz.Rect, str]]:
+def _visual_regions(page, blocks=None) -> list[tuple[fitz.Rect, str]]:
+    """Figuras de la página. Los fondos y marcos de recuadros de texto (ejemplos,
+    derivaciones, definiciones) no son figuras: su contenido se procesa como texto."""
     area = page.rect.get_area()
     regions = []
     for item in page.get_image_info():
         rect = fitz.Rect(item["bbox"]) & page.rect
         if rect.width >= 55 and rect.height >= 45 and rect.get_area() >= area * .018:
             regions.append((rect, "image"))
-    if drawings:
-        try:
-            clusters = page.cluster_drawings()
-        except (AttributeError, ValueError):
-            clusters = []
-        for box in clusters:
-            rect = fitz.Rect(box) & page.rect
-            if rect.width >= 110 and rect.height >= 65 and area * .055 <= rect.get_area() <= area * .85:
-                regions.append((rect, "drawing"))            # > 85 %: fondo de página
+    texts = [(fitz.Rect(b["bbox"]), sum(len(s["text"].strip()) for l in b["lines"] for s in l["spans"]))
+             for b in (blocks or []) if b.get("lines")]
+
+    def text_in(rect):
+        inside = [(box, n) for box, n in texts if _inside(box, rect, .8)]
+        return sum(n for _, n in inside), sum(box.get_area() for box, _ in inside)
+
+    try:
+        drawings = page.get_drawings()
+    except Exception:  # noqa: BLE001
+        drawings = []
+    keep, checked = [], {}
+    for d in drawings:
+        r = fitz.Rect(d["rect"])
+        if r.get_area() >= area * .06 and text_in(r)[0] >= 200:
+            key = tuple(round(v) for v in r)
+            if key not in checked:
+                inner = [x for x in drawings if x is not d and _inside(fitz.Rect(x["rect"]), r, .9)
+                         and not (fitz.Rect(x["rect"]).height <= 2.5 or fitz.Rect(x["rect"]).width <= 2.5)]
+                chars, covered = text_in(r)
+                grid = any(t.row_count >= 2 and t.col_count >= 2 for t in _tables(page, r))
+                checked[key] = not grid and (len(inner) <= 5 or covered >= .4 * r.get_area())
+            if checked[key]:
+                continue                               # fondo o marco de un recuadro de texto
+        keep.append(d)
+    try:
+        clusters = page.cluster_drawings(drawings=keep) if keep else []
+    except (AttributeError, ValueError, TypeError):
+        clusters = []
+    for box in clusters:
+        rect = fitz.Rect(box) & page.rect
+        if not (rect.width >= 110 and rect.height >= 65 and area * .055 <= rect.get_area() <= area * .85):
+            continue                                   # > 85 %: fondo de página
+        chars, covered = text_in(rect)
+        paths = sum(1 for d in keep if fitz.Rect(d["rect"]).intersects(rect))
+        if ((paths <= 4 and chars > 150) or (chars >= 300 and covered >= .45 * rect.get_area())) \
+                and not any(t.row_count >= 2 and t.col_count >= 2 for t in _tables(page, rect)):
+            continue                                   # sobre todo texto y sin cuadrícula: no es figura
+        regions.append((rect, "drawing"))
     regions.sort(key=lambda r: r[0].get_area(), reverse=True)
     distinct = []
     for rect, kind in regions:
@@ -362,6 +429,15 @@ def _table_markdown(table) -> str:
     filled = [sum(1 for r in rows if r[c]) for c in range(width)]
     if min(filled) == 0 or sum(1 for f in filled if f) < 2:
         return ""          # cajas de un diagrama, no una tabla
+    letters = [c for r in rows for v in r for c in v if c.isalpha()]
+    doubled = sum(1 for r in rows for v in r for a, b in zip(v, v[1:]) if a == b and a.isalpha())
+    if letters and doubled / len(letters) > .3:
+        return ""          # capas de texto sombreado mezcladas letra a letra: no es tabla
+    keep = [c for c in range(width) if filled[c] > 1]
+    if len(keep) < 2:      # tabla sin líneas internas: renglones de texto, menos tokens
+        return "\n".join(" ".join(v for v in r if v) for r in rows)
+    rows = [[r[c] for c in keep] for r in rows]
+    width = len(keep)
     out = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * width]
     out += ["| " + " | ".join(r) + " |" for r in rows[1:]]
     return "\n".join(out)
@@ -375,16 +451,20 @@ def _inside(inner: fitz.Rect, outer: fitz.Rect, ratio: float = .8) -> bool:
 # Fuentes que solo se usan para matemáticas (LaTeX, Word/Cambria Math, STIX, Symbol...).
 MATH_FONT = re.compile(
     r"cmmi|cmsy|cmex|cmbsy|cmmib|msam|msbm|eufm|eusm|rsfs|stmary|wasy|esint|lmmath|"
-    r"latinmodern-?math|cambria-?math|stix|xits|asana|mathjax|symbolmt|^symbol|\+symbol|"
-    r"mt-?extra|euclid|mtsy|mtex|txsy|txex|txmi|pxsy|pxex|pxmi|ntxmi|ntxsy|ntxex|mathdesign|"
-    r"libertinusmath|firamath|newcm.*math|dejavumath|garamondmath|math", re.I)
+    r"latinmodern-?math|cambria-?math|stix-?math|stixtwo-?math|stixsize|stixintegral|"
+    r"stixvariant|stixnonuni|xits-?math|asana-?math|mathjax|"
+    r"symbolmt|^symbol|\+symbol|mt-?extra|euclid(symbol|extra|math|fraktur)|mtsy|mtex|txsy|"
+    r"txex|txmi|pxsy|pxex|pxmi|ntxmi|ntxsy|ntxex|mathdesign|libertinusmath|firamath|"
+    r"newcm.*math|dejavumath|garamondmath|math", re.I)
+# Familias con variantes de texto y de matemáticas (STIX, XITS, Cambria): solo cuentan
+# las variantes "Math"; STIX-Regular, por ejemplo, es la fuente del texto normal.
 # Fuentes cuyo texto extraído no es fiable (símbolos codificados como letras).
 UNRELIABLE_FONT = re.compile(r"cmsy|cmex|cmbsy|msam|msbm|symbol|mt-?extra|esint|txsy|txex|"
                              r"pxsy|pxex|ntxsy|ntxex|stmary|wasy", re.I)
 MATH_CHARS = re.compile(r"[∑∏∫∮√∂∇∞≈≠≡≤≥∈∉⊂⊆∪∩±∓×÷·→←⇒⇔∝∀∃ΔΣΠΩαβγδεζηθλμνξπρστφχψω]")
-EQ_TAG = re.compile(r"^\s*\(\s*([A-Za-z]?\d[\w.\-]{0,9}|[A-Za-z]\.?\d?)\s*\)\s*$")
+EQ_TAG = re.compile(r"^\s*\(\s*([A-Za-z]{0,2}[-.]?\d[\w.\-]{0,9}|[A-Za-z]\.?\d?)\s*\)\s*$")
 SIG_CHARS = set("=+-()<>/")
-TEX_FONT = re.compile(r"cm(mi|sy|ex|r|bx|ti|bsy|mib)\d|msam|msbm|eufm|eusm|rsfs|txmi|txsy|txex|"
+TEX_FONT = re.compile(r"(^|\+)advp|cm(mi|sy|ex|r|bx|ti|bsy|mib)\d|msam|msbm|eufm|eusm|rsfs|txmi|txsy|txex|"
                       r"pxmi|pxsy|pxex|ntxmi|ntxsy|ntxex|stmary|wasy|esint", re.I)
 SYMBOL_FONT = re.compile(r"symbol", re.I)
 # Codificación Symbol de Adobe (Word la guarda en U+F020–U+F0FF sin mapa Unicode).
@@ -404,11 +484,23 @@ _SYM.update({"\"": "∀", "$": "∃", "'": "∋", "*": "∗", "-": "−", "@": "
 SYMBOL_PUA = {0xF000 + ord(k): v for k, v in _SYM.items()}
 
 
+ADV_FONT = re.compile(r"(^|\+)advp", re.I)          # fuentes matemáticas de Elsevier
+ADV_MAP = str.maketrans({"¼": "=", "ð": "(", "Þ": ")"})
+
+
 def _fix_symbol(text: str, font: str) -> str:
-    """Traduce caracteres privados de la fuente Symbol a Unicode real."""
+    """Traduce a Unicode los símbolos de Symbol (área privada) y los seguros de AdvP."""
     if SYMBOL_FONT.search(font) and any(0xF020 <= ord(c) <= 0xF0FF for c in text):
         return text.translate(SYMBOL_PUA)
+    if ADV_FONT.search(font):
+        return text.translate(ADV_MAP)
     return text
+
+
+def _is_math_span(span) -> bool:
+    if MATH_FONT.search(span["font"]):
+        return True
+    return bool(ADV_FONT.search(span["font"])) and not re.search(r"[A-Za-z]{3,}", span["text"])
 BULLETS = "•◦▪▫●○■□➢➤✓✔–—·-\uf0b7\uf0a7\uf076\uf0d8\uf0fc\uf0a8\uf06c\uf06e"
 
 
@@ -432,6 +524,10 @@ class LatexOCR:
         self.np = np
         opts = ort.SessionOptions()
         opts.log_severity_level = 3
+        try:
+            opts.use_deterministic_compute = True          # mismos resultados en cada ejecución
+        except AttributeError:
+            pass
         make = lambda n: ort.InferenceSession(str(folder / n), opts,
                                               providers=["CPUExecutionProvider"])
         self.encoder, self.decoder = make("encoder.onnx"), make("decoder.onnx")
@@ -465,7 +561,9 @@ class LatexOCR:
         return ((out - self.MEAN) / self.STD)[None, None].astype(np.float32)
 
     def __call__(self, gray, max_tokens: int = 350) -> str:
+        """LaTeX reconocido; self.looped indica si se cortó por bucle o por tope."""
         np = self.np
+        self.looped = False
         tensor = self._prepare(gray)
         if tensor is None:
             return ""
@@ -479,6 +577,13 @@ class LatexOCR:
             if token == 2:
                 break
             seq.append(token)
+            tail = seq[-24:]
+            if len(seq) > 24 and (len(set(tail[-8:])) == 1 or tail[:12] == tail[12:]
+                                  or len(set(tail)) <= 3):
+                self.looped = True                      # repetición: el modelo alucina
+                break
+        else:
+            self.looped = True
         text = "".join(self.vocab.get(t, "") for t in seq[1:]).replace("Ġ", " ").strip()
         return _tidy_latex(text)
 
@@ -562,13 +667,20 @@ def formula_to_latex(page, rect, spans) -> tuple[str, bool]:
     import numpy as np
     size = max((s["size"] for s in spans), default=11) or 11
     src = _source_signature(spans)
-    best = None
-    for px in (28, 24, 32, 20):
+    chars = sum(len("".join(s["text"].split())) for s in spans)
+    max_tokens = int(min(350, 30 + 6 * chars))           # tope proporcional a la fórmula
+    best, loops = None, 0
+    for px in (28, 24):          # medido: 3.ª y 4.ª escala casi nunca rescatan
+        if loops >= 2:
+            break                                        # dos bucles: no insistir
         zoom = max(.8, min(6.0, px / size))
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect + (-2, -2, 2, 2),
                               colorspace=fitz.csGRAY, alpha=False)
         gray = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width)
-        tex = _fix_equals(engine(gray), src)
+        tex = _fix_equals(engine(gray, max_tokens), src)
+        if getattr(engine, "looped", False):
+            loops += 1
+            continue
         if not tex or not _balanced(tex):
             continue
         recall, ratio = _score(src, tex)
@@ -596,11 +708,54 @@ def _math_line(line) -> bool:
     if not total:
         return False
     math = sum(len(s["text"].strip()) for s in spans
-               if MATH_FONT.search(s["font"]) or MATH_CHARS.search(s["text"]))
-    prose = " ".join(s["text"] for s in spans if not MATH_FONT.search(s["font"]))
+               if _is_math_span(s) or MATH_CHARS.search(s["text"]))
+    prose = " ".join(s["text"] for s in spans if not _is_math_span(s))
     words = len(re.findall(r"[A-Za-zÁÉÍÓÚáéíóúñÑ]{4,}", prose))
-    has_font = any(MATH_FONT.search(s["font"]) for s in spans)
+    has_font = any(_is_math_span(s) for s in spans)
     return (has_font and words <= 1) or (math / total >= .3 and words <= 2)
+
+
+def _rules(page) -> list:
+    """Trazos finos horizontales (barras de fracción, raíces) de la página."""
+    out = []
+    for d in page.get_drawings():
+        r = fitz.Rect(d["rect"])
+        if r.width >= 3 and r.height <= 2.5:
+            out.append(r)
+    return out
+
+
+BIG_FONT = re.compile(r"cmex|cmsy|stixsize|stixintegral|extension|largesymbol|mt-?extra|esint|"
+                      r"txex|pxex|ntxex|symbol", re.I)
+
+
+def _rows(group: dict) -> int:
+    rows: list[float] = []
+    for line in group["lines"]:
+        box = fitz.Rect(line["bbox"])
+        size = max((s["size"] for s in line["spans"]), default=10)
+        cy = (box.y0 + box.y1) / 2
+        if not any(abs(cy - r) < .45 * size for r in rows):
+            rows.append(cy)
+    return len(rows)
+
+
+def needs_recognition(group: dict, rules: list) -> bool:
+    """Solo van al modelo las fórmulas con estructura 2D real o texto ilegible; las que ya
+    son Unicode legible (σ = √V(X), S = {x | x > 0}, pasos de un ejemplo) quedan como texto."""
+    spans = group["spans"]
+    if any(_unreliable(s["text"], s["font"]) for s in spans):
+        return True
+    inner = group["rect"] + (0, -1, 0, 1)
+    if any(inner.intersects(r) and r.width < inner.width * 1.5 for r in rules):
+        return True                                        # barra de fracción o de raíz
+    if _rows(group) >= 2:
+        text = "".join(s["text"] for s in spans)
+        base = sorted(s["size"] for s in spans)[len(spans) // 2]
+        if any(c in text for c in "∑∏∫∮⋃⋂") or any(s["size"] > 1.5 * base for s in spans) \
+                or any(BIG_FONT.search(s["font"]) for s in spans):
+            return True                                    # límites o delimitadores grandes
+    return False
 
 
 def find_formulas(blocks) -> list[dict]:
@@ -623,9 +778,10 @@ def find_formulas(blocks) -> list[dict]:
             g["rect"] |= rect
             g["keys"].add(key)
             g["spans"].extend(line["spans"])
+            g["lines"].append(line)
         else:
             groups.append({"rect": fitz.Rect(rect), "keys": {key}, "spans": list(line["spans"]),
-                           "tag": ""})
+                           "tag": "", "lines": [line]})
     grouped = set().union(*(g["keys"] for g in groups)) if groups else set()
     for bi, b in enumerate(blocks):                       # límites y exponentes sueltos
         for li, line in enumerate(b["lines"]):
@@ -641,6 +797,7 @@ def find_formulas(blocks) -> list[dict]:
                     g["rect"] |= rect
                     g["keys"].add((bi, li))
                     g["spans"].extend(line["spans"])
+                    g["lines"].append(line)
                     break
     for key, rect, text in tags:
         cy = (rect.y0 + rect.y1) / 2
@@ -722,7 +879,7 @@ def book_folder(output: Path, source: Path) -> Path:
 
 
 def _visual_pdf(rows: list[dict], folder: Path, stem: str) -> list[str]:
-    figures = [fig for row in rows for fig in row["figures"]]
+    figures = [fig for row in rows for fig in row["figures"] if fig.get("kind") != "ecuacion"]
     produced: list[str] = []
     pdf = fitz.open()
     size = 0
@@ -745,7 +902,7 @@ def _visual_pdf(rows: list[dict], folder: Path, stem: str) -> list[str]:
             continue
         pix = fitz.Pixmap(str(path))
         jpeg = pix.tobytes("jpeg", jpg_quality=80)
-        if len(pdf) >= 60 or (len(pdf) and size + len(jpeg) > 19_000_000):
+        if len(pdf) >= 150 or (len(pdf) and size + len(jpeg) > 19_000_000):
             flush()
         ratio = min(523 / pix.width, 760 / pix.height)
         w, h = pix.width * ratio, pix.height * ratio
@@ -792,6 +949,7 @@ def convert(
             rows = []
         if not checkpoint.exists():
             _write_checkpoint(checkpoint, signature, rows)
+        check_not_scanned(doc)
         info = analyze_document(doc)
         counters = {"fig": 0, "eq": 0}
         for row in rows:
@@ -811,6 +969,67 @@ def convert(
     return result
 
 
+def _bullet_marks(page) -> list:
+    """Viñetas dibujadas (triángulos, cuadros, círculos pequeños) o como imagen diminuta."""
+    marks = []
+    try:
+        for d in page.get_drawings():
+            r = fitz.Rect(d["rect"])
+            if 2 <= r.width <= 12 and 2 <= r.height <= 12 and d.get("fill") is not None:
+                marks.append(r)
+    except Exception:  # noqa: BLE001
+        pass
+    for item in page.get_image_info():
+        r = fitz.Rect(item["bbox"])
+        if 2 <= r.width <= 14 and 2 <= r.height <= 14:
+            marks.append(r)
+    return marks
+
+
+def _figure_ocr(page, clip, languages: str) -> str:
+    """Texto dentro de una figura raster (infografías, tablas escaneadas, gráficas)."""
+    if not find_tesseract()[0]:
+        return ""
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=clip, alpha=False)
+        text = " ".join(_ocr(pix, languages).split())
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+        return ""
+    if len(re.findall(r"[A-Za-zÁÉÍÓÚáéíóúñÑ]{3,}", text)) < 3:
+        return ""                                     # sin texto útil (foto, curva sin rótulos)
+    return text[:3000]
+
+
+def _reading_order(items: list) -> list:
+    """Orden de lectura con columnas: entre dos elementos de ancho completo (títulos,
+    figuras anchas) se lee primero toda la columna izquierda y luego la derecha."""
+    if len(items) < 3:
+        return sorted(items, key=lambda it: (round(it[0].y0), it[0].x0))
+    x0 = min(r.x0 for r, _ in items)
+    x1 = max(r.x1 for r, _ in items)
+    mid = (x0 + x1) / 2
+    def col(r):
+        if r.x1 <= mid + 8:
+            return 0
+        if r.x0 >= mid - 8:
+            return 1
+        return -1
+    two_columns = sum(1 for r, _ in items if col(r) == 1) >= 2 and \
+        sum(1 for r, _ in items if col(r) == 0) >= 2
+    ordered = sorted(items, key=lambda it: (round(it[0].y0), it[0].x0))
+    if not two_columns:
+        return ordered
+    out, band = [], []
+    for it in ordered:
+        if col(it[0]) == -1:
+            out += sorted(band, key=lambda b: (col(b[0]), round(b[0].y0), b[0].x0))
+            band = []
+            out.append(it)
+        else:
+            band.append(it)
+    return out + sorted(band, key=lambda b: (col(b[0]), round(b[0].y0), b[0].x0))
+
+
 def _merge_close(entries: list[list]) -> list[list]:
     """Une bloques contiguos (renglones de un mismo párrafo o pie partido en bloques)."""
     merged: list[list] = []
@@ -819,6 +1038,14 @@ def _merge_close(entries: list[list]) -> list[list]:
             prev_rect, prev_text = merged[-1]
             gap = rect.y0 - prev_rect.y1
             overlap = min(rect.x1, prev_rect.x1) - max(rect.x0, prev_rect.x0)
+            level = text.split(" ", 1)[0]
+            if level in ("##", "###") and prev_text.split(" ", 1)[0] == level and -1 <= gap <= 8 \
+                    and overlap > 0 and not NUMBERED_HEADING.match(text[len(level) + 1:]):
+                merged[-1] = [prev_rect | rect, prev_text + " " + text[len(level) + 1:]]
+                continue                               # título partido en dos renglones
+            if prev_text.endswith("-") and text[:1].islower() and -1 <= gap <= 4 and overlap > 0:
+                merged[-1] = [prev_rect | rect, prev_text[:-1] + text]
+                continue                               # palabra cortada entre dos bloques
             if -1 <= gap <= 3 and overlap > 0 and not text.startswith("#") \
                     and not prev_text.startswith("#") and not text.startswith("$$"):
                 merged[-1] = [prev_rect | rect, prev_text + " " + text]
@@ -850,10 +1077,14 @@ def _group_labels(labels: list[list]) -> list[str]:
 def _process_page(page, index, info, languages, label, stem, images, counters):
     height = page.rect.height
     blocks = [b for b in page.get_text("dict", sort=True)["blocks"] if b["type"] == 0]
+    for b in blocks:
+        for l in b["lines"]:
+            for sp in l["spans"]:
+                sp["text"] = _fix_symbol(sp["text"], sp["font"])
     raw = "".join(s["text"] for b in blocks for l in b["lines"] for s in l["spans"])
     scanned = len(re.findall(r"\w", raw)) < 45 and _image_coverage(page) >= .5
     ocr_error = None
-    items: list[tuple[float, float, str]] = []
+    items: list[tuple] = []
     figures = []
     stats = {"tables": 0, "equations": 0, "eq_flagged": 0, "inline": 0}
 
@@ -868,7 +1099,8 @@ def _process_page(page, index, info, languages, label, stem, images, counters):
             file_name = f"Imagen {n:04d} ({stem}).png"
         _save_figure(page, clip, images / file_name)
         figures.append({"id": image_id, "file": file_name, "page": index + 1, "kind": kind})
-        return f"![{image_id}](<imagenes/{file_name}>)"
+        short = image_id.split(" (", 1)[0]               # "Imagen 27": el libro va en el encabezado
+        return f"![{short}](<imagenes/{file_name}>)"
 
     if scanned:
         text = ""
@@ -878,30 +1110,59 @@ def _process_page(page, index, info, languages, label, stem, images, counters):
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
             ocr_error = str(exc)[:300]
             text = f"[OCR pendiente: {ocr_error}]"
-        items.append((0, 0, save(page.rect) + ("\n\n" + text if text else "")))
+        items.append((page.rect, save(page.rect) + ("\n\n" + text if text else "")))
     else:
         formulas = find_formulas(blocks)
         skip = set().union(*(f["keys"] for f in formulas)) if formulas else set()
+        rules = _rules(page) if formulas else []
         for f in formulas:
-            tex, ok = formula_to_latex(page, f["rect"], f["spans"])
+            if not needs_recognition(f, rules):
+                lines = sorted(f["lines"], key=lambda l: (l["bbox"][1], l["bbox"][0]))
+                text = " ".join(_line_text(l, None, stats).strip() for l in lines)
+                text = " ".join(text.split()) + (f" ({f['tag']})" if f["tag"] else "")
+                stats["math_text"] = stats.get("math_text", 0) + 1
+                items.append((f["rect"], text))
+                continue
+            lines = sorted(f["lines"], key=lambda l: (l["bbox"][1], l["bbox"][0]))
+            size = max((sp["size"] for sp in f["spans"]), default=10)
+            readable = not any(_unreliable(sp["text"], sp["font"]) for sp in f["spans"])
+            too_big = f["rect"].height > 6 * size or _rows(f) > 5
+            tex, ok = ("", False) if too_big else formula_to_latex(page, f["rect"], f["spans"])
             tag = f" \\tag{{{f['tag']}}}" if f["tag"] else ""
             clip = f["rect"] + (-3, -3, 3, 3)
-            if tex:
+            if tex and ok:
                 md = f"$${tex}{tag}$$"
                 stats["equations"] += 1
-                if not ok:
-                    stats["eq_flagged"] += 1
-                    md += " " + save(clip, "ecuacion") + " [verificar fórmula]"
+            elif readable:                               # el texto del PDF es mejor que un LaTeX dudoso
+                text = " ".join(" ".join(_line_text(l, None, stats).split()) for l in lines)
+                stats["eq_flagged"] += 1
+                md = text + (f" ({f['tag']})" if f["tag"] else "") + " " + \
+                     save(clip, "ecuacion") + " [verificar fórmula]"
+            elif tex:
+                stats["equations"] += 1
+                stats["eq_flagged"] += 1
+                md = f"$${tex}{tag}$$ " + save(clip, "ecuacion") + " [verificar fórmula]"
             else:
                 stats["eq_flagged"] += 1
                 md = save(clip, "ecuacion") + (f" ({f['tag']})" if f["tag"] else "") + \
                      " [fórmula sin convertir]"
-            items.append((f["rect"].y0, f["rect"].x0, md))
+            items.append((f["rect"], md))
         formula_rects = [f["rect"] for f in formulas]
-        regions = [(r, k) for r, k in _visual_regions(page)
+        regions = [(r, k) for r, k in _visual_regions(page, blocks)
                    if not any((r & fr).get_area() >= .5 * r.get_area() for fr in formula_rects)]
         used: set[int] = set()
         for rect, kind in regions:
+            near = rect + (-28, -6, 28, 28)                # rótulos de ejes y leyendas
+            for i, b in enumerate(blocks):
+                box = fitz.Rect(b["bbox"])
+                text = "".join(s["text"] for l in b["lines"] for s in l["spans"]).strip()
+                sizes = [s["size"] for l in b["lines"] for s in l["spans"] if s["text"].strip()]
+                numeric = sum(c.isdigit() or c in " .,-−%()" for c in text) / max(1, len(text))
+                if i in used or not text or _inside(box, rect) or not _inside(box, near, .95) \
+                        or len(text) > (120 if numeric >= .6 else 40) or CAPTION.match(text) \
+                        or (sizes and max(sizes) > info["body"] * 1.1):
+                    continue
+                rect = rect | box
             clip = _fit_clip(rect, blocks, page.rect)
             extra = []
             tables = []
@@ -930,7 +1191,12 @@ def _process_page(page, index, info, languages, label, stem, images, counters):
             labels = _group_labels(labels)
             if labels:
                 extra.insert(0, "Texto en la figura: " + " · ".join(labels))
-            items.append((rect.y0, rect.x0, save(clip) + ("\n\n" + "\n\n".join(extra) if extra else "")))
+            elif kind == "image" and rect.get_area() >= .04 * page.rect.get_area():
+                ocr_text = _figure_ocr(page, clip, languages)
+                if ocr_text:
+                    stats["fig_ocr"] = stats.get("fig_ocr", 0) + 1
+                    extra.insert(0, "Texto en la figura (OCR): " + ocr_text)
+            items.append((rect, save(clip) + ("\n\n" + "\n\n".join(extra) if extra else "")))
         recent: deque[str] = deque(maxlen=8)
         entries = []
         edge = _edge_indices([b["bbox"] for b in blocks if b["lines"]], height)
@@ -942,7 +1208,7 @@ def _process_page(page, index, info, languages, label, stem, images, counters):
                 continue
             text = _block_text(b, height, info["repeated"], info["body"], skip, i, page, stats,
                                edge=i in edge)
-            key = _norm(text)
+            key = " ".join(text.split()).casefold()        # exacta: "Paso 1" ≠ "Paso 2"
             if not text or (len(key) > 3 and key in recent):
                 continue                                  # bloque duplicado (sombra)
             recent.append(key)
@@ -951,10 +1217,17 @@ def _process_page(page, index, info, languages, label, stem, images, counters):
             for l in lines[1:]:
                 rect |= fitz.Rect(l["bbox"])
             entries.append([rect, text])
+        marks = _bullet_marks(page)
+        entries = [list(e) for e in _reading_order([tuple(e) for e in entries])]
         for rect, text in _merge_close(entries):
-            items.append((rect.y0, rect.x0, text))
-    items.sort(key=lambda it: (round(it[0]), it[1]))
-    text = "\n\n".join(t for _, _, t in items) or "[Página sin texto reconocible]"
+            first = fitz.Rect(rect.x0, rect.y0, rect.x1, min(rect.y1, rect.y0 + 14))
+            if marks and not text.startswith(("#", "-", "•", "$$", "!")) and any(
+                    m.x1 <= first.x0 + 2 and first.x0 - m.x1 <= 22 and
+                    min(m.y1, first.y1) - max(m.y0, first.y0) > 0 for m in marks):
+                text = "- " + text
+            items.append((rect, text))
+    items = _reading_order(items)
+    text = "\n\n".join(t for _, t in items) or "[Página sin texto reconocible]"
     return {"page": index + 1, "text": text, "figures": figures, "ocr": scanned,
             "ocr_error": ocr_error, **stats}
 
@@ -1000,7 +1273,8 @@ def _export(rows, source, folder, label, stem, total, max_pages) -> dict:
             f"{f' ({flagged} por verificar)' if flagged else ''} · {ocr_pages} páginas con OCR.\n\n",
             "Formato: [p. N] marca el inicio de la página N del PDF; ^{} y _{} son superíndice "
             "y subíndice; $...$ y $$...$$ son fórmulas LaTeX ([?] o [verificar fórmula] = "
-            "revisar contra la imagen). Las imágenes están en la carpeta `imagenes`"]
+            f"revisar contra la imagen). `Imagen N` y `Ecuación N` equivalen a `Imagen N ({label})`; "
+            "están en la carpeta `imagenes`"]
     head.append(f" y en el anexo visual {', '.join(f'`{v}`' for v in visual)}.\n\n" if visual
                 else ".\n\n")
     if toc:
@@ -1022,5 +1296,7 @@ def _export(rows, source, folder, label, stem, total, max_pages) -> dict:
     return {"source": str(source), "pages": total, "figures": figures,
             "tables": sum(r.get("tables", 0) for r in rows), "ocr_pages": ocr_pages,
             "equations": equations, "equations_flagged": flagged, "inline_math": inline,
+            "math_text": sum(r.get("math_text", 0) for r in rows),
+            "figure_ocr": sum(r.get("fig_ocr", 0) for r in rows),
             "ocr_failed": sum(1 for r in rows if r.get("ocr_error")),
             "folder": str(folder), "merged": merged, "parts": names, "visual_pdfs": visual}

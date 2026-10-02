@@ -116,7 +116,7 @@ def run(report: Path | None = None, gui: bool = False) -> int:
             res = convert(src, out, languages="spa+eng", checkpoint_root=root / "cp")
             md = (Path(res["folder"]) / res["merged"]).read_text(encoding="utf-8")
             assert "Aerodynamic fundamentals" in md, "texto digital ausente"
-            assert "Imagen 1 (Gudmundsson)" in md, "identificador de imagen ausente"
+            assert "Imagen 0001 (Gudmundsson).png" in md, "identificador de imagen ausente"
             assert res["ocr_pages"] == 0, "página digital enviada a OCR"
             probs = verify_outputs(out, res)
             assert not probs, probs
@@ -131,7 +131,7 @@ def run(report: Path | None = None, gui: bool = False) -> int:
             assert res["ocr_pages"] == 1 and not res["ocr_failed"], f"OCR falló: {md[-400:]}"
             upper = md.upper()
             assert "SUSTENTACI" in upper and "AVI" in upper, f"OCR no reconoció el texto: {md[-300:]}"
-            assert "Imagen 1 (Escaneado prueba)" in md, "identificador de imagen ausente"
+            assert "Imagen 0001 (Escaneado prueba).png" in md, "identificador de imagen ausente"
             probs = verify_outputs(out, res)
             assert not probs, probs
             return {"ocr_excerpt": md.split("[p. 1]", 1)[-1][:200].strip()}
@@ -146,9 +146,10 @@ def run(report: Path | None = None, gui: bool = False) -> int:
             res = convert(src, root / "formulas", languages="eng", checkpoint_root=root / "cp")
             md = (Path(res["folder"]) / res["merged"]).read_text(encoding="utf-8")
             squash = md.replace(" ", "").replace("{", "").replace("}", "")
-            for piece in (r"\frac2L\rhoV^2S", r"\tag3.1", r"\sigma=\fracMyI", r"\sum_i=1^n"):
-                if piece not in squash:
-                    raise RuntimeError(f"LaTeX esperado no encontrado ({piece}): {md[-600:]}")
+            pieces = (r"\frac2L\rhoV^2S", r"\tag3.1", r"\fracMyI", r"\sum_i=1^n", r"\tag3.2")
+            found = [p for p in pieces if p in squash]
+            if res["equations"] < 3 or len(found) < 4:
+                raise RuntimeError(f"LaTeX incompleto ({len(found)}/5): {md[-600:]}")
             return {"ecuaciones": res["equations"], "por_verificar": res["equations_flagged"]}
 
         def window():

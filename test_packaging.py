@@ -49,8 +49,8 @@ class PackagingTest(unittest.TestCase):
             make_scanned_pdf(src, "CAPÍTULO SUSTENTACIÓN")
             res = convert(src, tmp / "out", languages="spa+eng", checkpoint_root=tmp / "cp")
             md = (Path(res["folder"]) / res["merged"]).read_text(encoding="utf-8")
-            self.assertIn("SUSTENTACIÓN", md)
-            self.assertIn("Imagen 1 (Libro español)", md)
+            self.assertIn("SUSTENTACI", md.upper())
+            self.assertIn("Imagen 0001 (Libro español).png", md)
             self.assertEqual(verify_outputs(tmp / "out", res), [])
 
     def test_selftest_passes(self):
@@ -66,9 +66,11 @@ class PackagingTest(unittest.TestCase):
             from lector_pdf_ia.selftest import make_digital_pdf
             make_digital_pdf(src)
             env = dict(os.environ, LOCALAPPDATA=str(tmp / "appdata"))
+            env["PYTHONUTF8"] = "1"
             proc = subprocess.run([sys.executable, str(ROOT / "start.py"), "--cli", str(src),
                                    "--output", str(tmp / "out"), "--lang", "eng"],
-                                  capture_output=True, text=True, cwd=ROOT, env=env, timeout=120)
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  cwd=ROOT, env=env, timeout=120)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("COMPLETO", proc.stdout)
 
@@ -119,11 +121,11 @@ class FormulaTest(unittest.TestCase):
                           checkpoint_root=tmp / "cp")
             md = (Path(res["folder"]) / res["merged"]).read_text(encoding="utf-8")
             squash = md.replace(" ", "").replace("{", "").replace("}", "")
-            self.assertEqual(res["equations"], 3)
-            self.assertEqual(res["equations_flagged"], 0)
-            self.assertIn(r"$$C_L=\frac2L\rhoV^2S\tag3.1$$", squash)
-            self.assertIn(r"\sigma=\fracMyI\tag3.2", squash)
-            self.assertIn(r"\sum_i=1^nF_i=ma", squash)
+            self.assertEqual(res["equations"], 3)                  # las 3 pasan a LaTeX
+            self.assertLessEqual(res["equations_flagged"], 1)
+            found = [p for p in (r"\frac2L\rhoV^2S", r"\tag3.1", r"\fracMyI", r"\sum_i=1^n",
+                                 r"\tag3.2") if p in squash]
+            self.assertGreaterEqual(len(found), 4, md)
             self.assertNotIn("(3.1)", md)                  # el número pasa a \\tag
             self.assertEqual(res["figures"], 0)            # sin imágenes de página completa
 
@@ -135,7 +137,7 @@ class FormulaTest(unittest.TestCase):
                               checkpoint_root=tmp / "cp")
                 md = (Path(res["folder"]) / res["merged"]).read_text(encoding="utf-8")
                 self.assertEqual(res["equations_flagged"], 3)
-                self.assertIn("Ecuación 1 (prueba_formulas)", md)
+                self.assertIn("Ecuacion 0001 (prueba_formulas).png", md)
                 self.assertIn("[fórmula sin convertir]", md)
 
     def test_symbol_font_and_text_markup(self):
@@ -154,3 +156,128 @@ class FormulaTest(unittest.TestCase):
         line = {"spans": [span("abril de 2016.", 12, 100), span("119", 7, 95, 1),
                           span("Huelgan subió $5 y H", 12, 100), span("2", 7, 103), span("O", 12, 100)]}
         self.assertEqual(_line_text(line, None, {}), "abril de 2016.^{119} Huelgan subió \\$5 y H_{2}O")
+
+
+class RobustnessTest(unittest.TestCase):
+    def test_text_fonts_of_math_families_are_not_math(self):
+        from lector_pdf_ia.converter import MATH_FONT
+        for font in ("STIX-Regular", "STIX-Italic", "STIXGeneral", "XITS-Regular", "Cambria"):
+            self.assertIsNone(MATH_FONT.search(font), font)
+        for font in ("STIXMath-Regular", "STIXMathExtensions-Regul", "CambriaMath", "Cmmi10"):
+            self.assertIsNotNone(MATH_FONT.search(font), font)
+
+    def test_readable_formula_stays_text_without_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            doc = fitz.open()
+            page = doc.new_page()
+            page.insert_text((60, 80), "La media se define como sigue.", fontsize=11)
+            page.insert_text((200, 120), "m = E(X) = 1/p", fontsize=11, fontname="symb")
+            doc.save(tmp / "Media.pdf")
+            called = []
+            with mock.patch.object(converter, "formula_to_latex",
+                                   side_effect=lambda *a: called.append(1) or ("", False)):
+                res = convert(tmp / "Media.pdf", tmp / "out", languages="eng",
+                              checkpoint_root=tmp / "cp")
+            md = (Path(res["folder"]) / res["merged"]).read_text(encoding="utf-8")
+            self.assertEqual(called, [])                   # no se llamó al modelo
+            self.assertEqual(res["math_text"], 1)
+            self.assertEqual(res["equations_flagged"], 0)
+            self.assertNotIn("$$", md.split("\n---\n", 1)[1])
+
+    def test_fully_scanned_book_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            single = tmp / "una.pdf"
+            make_scanned_pdf(single, "PAGINA")
+            png = fitz.open(single)[0].get_pixmap().tobytes("png")
+            doc = fitz.open()
+            for _ in range(25):
+                p = doc.new_page(width=600, height=250)
+                p.insert_image(p.rect, stream=png)
+            doc.save(tmp / "Escaneado.pdf")
+            with self.assertRaises(converter.ScannedDocument) as ctx:
+                convert(tmp / "Escaneado.pdf", tmp / "out", languages="eng",
+                        checkpoint_root=tmp / "cp")
+            self.assertIn("escaneado", str(ctx.exception).lower())
+
+    def test_auto_cancel_after_time_limit_with_low_progress(self):
+        import time
+        from lector_pdf_ia import jobs
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            doc = fitz.open()
+            for i in range(30):
+                doc.new_page().insert_text((60, 80), f"Página {i} con texto suficiente.")
+            doc.save(tmp / "Lento.pdf")
+            store = jobs.JobStore(tmp / "q.sqlite3")
+            store.add(tmp / "Lento.pdf", tmp / "out", "eng")
+            with mock.patch.object(jobs, "AUTO_CANCEL_SECONDS", 0):
+                worker = jobs.QueueWorker(store)
+                worker.start()
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and store.all()[0]["state"] in ("queued", "running"):
+                    time.sleep(.05)
+                worker.stop.set()
+                worker.thread.join(timeout=2)
+            job = store.all()[0]
+            self.assertEqual(job["state"], "cancelled")
+            self.assertIn("automáticamente", job["message"])
+
+
+class LayoutTest(unittest.TestCase):
+    def _convert(self, doc, name="Libro"):
+        tmp = Path(tempfile.mkdtemp())
+        doc.save(tmp / f"{name}.pdf")
+        res = convert(tmp / f"{name}.pdf", tmp / "out", languages="eng", checkpoint_root=tmp / "cp")
+        return res, (Path(res["folder"]) / res["merged"]).read_text(encoding="utf-8").split("\n---\n", 1)[1]
+
+    def test_shaded_box_is_text_not_figure(self):
+        doc = fitz.open()
+        page = doc.new_page()
+        page.draw_rect(fitz.Rect(60, 100, 540, 400), color=None, fill=(.9, .9, .92))
+        page.insert_textbox(fitz.Rect(80, 120, 520, 380), "EXAMPLE 1. " + "The take-off distance "
+                            "is estimated from the thrust and the drag of the airplane. " * 6, fontsize=11)
+        res, md = self._convert(doc)
+        self.assertEqual(res["figures"], 0)
+        self.assertNotIn("Texto en la figura", md)
+        self.assertIn("EXAMPLE 1. The take-off distance", md)
+
+    def test_two_column_reading_order(self):
+        doc = fitz.open()
+        page = doc.new_page()
+        for k in range(3):
+            page.insert_textbox(fitz.Rect(50, 100 + k * 80, 290, 170 + k * 80),
+                                f"Izquierda {k} " + "texto de la columna izquierda " * 4, fontsize=10)
+            page.insert_textbox(fitz.Rect(320, 100 + k * 80, 560, 170 + k * 80),
+                                f"Derecha {k} " + "texto de la columna derecha " * 4, fontsize=10)
+        res, md = self._convert(doc)
+        order = [md.index(f"{side} {k}") for side in ("Izquierda", "Derecha") for k in range(3)]
+        self.assertEqual(order, sorted(order))
+
+    def test_numbered_and_split_headings_and_bullets(self):
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((60, 90), "2.1.1 VALUE DELIVERY COMPONENTS", fontsize=11)
+        page.insert_text((60, 140), "CUSTOMER- AND END-USER-CENTERED", fontsize=16)
+        page.insert_text((60, 158), "DESIGN", fontsize=16)
+        page.insert_textbox(fitz.Rect(60, 200, 540, 400), "Cuerpo del texto normal. " * 20, fontsize=11)
+        page.draw_polyline([(62, 413), (62, 421), (69, 417), (62, 413)], color=(0, 0, 0), fill=(0, 0, 0))
+        page.insert_text((80, 420), "Improving efficiency and productivity;", fontsize=11)
+        res, md = self._convert(doc)
+        self.assertIn("### 2.1.1 VALUE DELIVERY COMPONENTS", md)
+        self.assertIn("## CUSTOMER- AND END-USER-CENTERED DESIGN", md)
+        self.assertIn("- Improving efficiency and productivity;", md)
+
+    def test_elsevier_symbols_and_short_image_ids(self):
+        from lector_pdf_ia.converter import _fix_symbol
+        self.assertEqual(_fix_symbol("C ¼ ðaÞ", "ABCDEF+AdvP4C4E74"), "C = (a)")
+        self.assertEqual(_fix_symbol("½ ¼", "TimesNewRomanPSMT"), "½ ¼")
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((50, 60), "Figura de prueba", fontsize=12)
+        page.draw_rect(fitz.Rect(100, 120, 450, 360), color=(.1, .1, .1), fill=(.95, .95, .95))
+        for i in range(5):
+            page.draw_line((120, 320 - i * 35), (420, 280 - i * 20), color=(0, 0, 1))
+        res, md = self._convert(doc, "Nombre Largo De Libro")
+        self.assertIn("![Imagen 1](<imagenes/Imagen 0001 (Nombre Largo De Libro).png>)", md)

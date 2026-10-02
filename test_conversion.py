@@ -69,10 +69,10 @@ class ConversionTest(unittest.TestCase):
             out = root / "export"
             res = convert(src, out, languages="eng", checkpoint_root=root / "cp")
             folder = Path(res["folder"])
-            self.assertEqual(folder, out / "Gudmundsson")
+            self.assertTrue(folder.samefile(out / "Gudmundsson"))   # 8.3 vs. nombre largo
             md = (folder / res["merged"]).read_text(encoding="utf-8")
             self.assertIn("Aerodynamic fundamentals", md)
-            self.assertIn("Imagen 1 (Gudmundsson)", md)
+            self.assertIn("Imagen 0001 (Gudmundsson).png", md)
             self.assertIn("[p. 1]", md)
             self.assertTrue((folder / "Gudmundsson.pdf").is_file())
             self.assertTrue((folder / "imagenes" / "Imagen 0001 (Gudmundsson).png").is_file())
@@ -135,7 +135,7 @@ class ConversionTest(unittest.TestCase):
             text = (Path(res["folder"]) / res["merged"]).read_text(encoding="utf-8")
             self.assertEqual(res["ocr_pages"], 1)
             self.assertIn("AIRCRAFT", text)
-            self.assertIn("Imagen 1 (Scan)", text)
+            self.assertIn("Imagen 0001 (Scan).png", text)
 
     def test_queue_survives_reopen(self):
         with tempfile.TemporaryDirectory() as root:

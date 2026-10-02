@@ -33,10 +33,18 @@ if (Test-Path (Join-Path $tesseract 'tessdata\configs')) {
 }
 
 # 2) Entorno de compilación y pruebas del código con el Tesseract mínimo.
-py -3 -m venv .venv
+# Python de compilación: el que prepara GitHub (3.12); en un equipo propio, py -3.12.
+if ($env:pythonLocation -and (Test-Path (Join-Path $env:pythonLocation 'python.exe'))) {
+    & (Join-Path $env:pythonLocation 'python.exe') -m venv .venv
+} else {
+    py -3.12 -m venv .venv
+}
+if ($LASTEXITCODE -ne 0) { throw 'No se pudo crear el entorno de Python 3.12.' }
+$env:PYTHONUTF8 = '1'
 $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 & $python -m pip install --upgrade pip
 & $python -m pip install -r requirements.txt -r requirements-build.txt
+if ($LASTEXITCODE -ne 0) { throw 'Falló la instalación de dependencias.' }
 & $python podar_tesseract.py $tmin
 if ($LASTEXITCODE -ne 0) { throw 'No se pudo reducir la copia de Tesseract.' }
 $models = Join-Path $PSScriptRoot 'build\latex_ocr'
