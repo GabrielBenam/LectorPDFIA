@@ -26,7 +26,7 @@ try:  # PyMuPDF >= 1.24 expone "pymupdf"; "fitz" queda como alias obsoleto.
 except ImportError:  # pragma: no cover
     import fitz
 
-FORMAT_VERSION = 4          # invalida checkpoints de la versión anterior
+FORMAT_VERSION = 5          # invalida checkpoints de la versión anterior
 EDGE_TOP, EDGE_BOTTOM = .20, .80   # franja amplia; solo se quita lo que se repite
 NAME_CHARS = 60             # límite del nombre en archivos (rutas de Windows < 260)
 CAPTION = re.compile(r"^\s*(figura|fig\.|gr[aá]fic[oa]|tabla|cuadro|esquema|diagrama|"
@@ -212,7 +212,8 @@ def analyze_document(doc) -> dict:
         height = page.rect.height
         seen = set()
         text_blocks = [b for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
-        for k in _edge_indices([b[:4] for b in text_blocks], height):
+        mat = page.rotation_matrix
+        for k in _edge_indices([tuple(fitz.Rect(b[:4]) * mat) for b in text_blocks], height):
             b = text_blocks[k]
             if True:
                 for line in b[4].splitlines():
@@ -233,9 +234,62 @@ def analyze_document(doc) -> dict:
 def _image_coverage(page) -> float:
     area = page.rect.get_area() or 1
     covered = 0.0
+    mat = page.rotation_matrix              # imágenes en coordenadas sin girar -> visibles
     for item in page.get_image_info():
-        covered += (fitz.Rect(item["bbox"]) & page.rect).get_area()
+        covered += ((fitz.Rect(item["bbox"]) * mat) & page.rect).get_area()
     return min(1.0, covered / area)
+
+
+def _dominant_dir(page) -> tuple[int, int]:
+    """Dirección en que corre la mayor parte del texto: (1, 0) = horizontal normal."""
+    votes: Counter = Counter()
+    for b in page.get_text("dict")["blocks"]:
+        for line in b.get("lines", []):
+            n = sum(len(sp["text"]) for sp in line["spans"])
+            votes[(round(line["dir"][0]), round(line["dir"][1]))] += n
+    return votes.most_common(1)[0][0] if votes else (1, 0)
+
+
+_ANGLE_FOR_DIR = {(0, -1): 270, (0, 1): 90, (-1, 0): 180}
+
+
+class UprightPages:
+    """Entrega cada página con el texto horizontal y las coordenadas de texto, imágenes,
+    dibujos y recortes en un mismo sistema. Los PDF escaneados suelen traer /Rotate 90 y
+    el texto en vertical: PyMuPDF entrega entonces el texto sin girar y los recortes
+    girados, y todo (fórmulas, figuras, orden de lectura) queda desalineado."""
+
+    def __init__(self, doc):
+        self.doc = doc
+        self._tmp = None
+
+    def page(self, index: int):
+        page = self.doc[index]
+        if not page.rotation:
+            return page
+        try:
+            page.set_rotation(0)
+            direction = _dominant_dir(page)
+            if direction == (1, 0):
+                return page                                  # texto ya horizontal sin giro
+            first = _ANGLE_FOR_DIR.get(direction, 270)
+            width, height = page.rect.width, page.rect.height
+            for angle in dict.fromkeys((first, 270, 90, 180)):
+                if self._tmp is not None:
+                    self._tmp.close()
+                self._tmp = fitz.open()
+                new = self._tmp.new_page(-1, width=height, height=width)
+                new.show_pdf_page(new.rect, self.doc, index, rotate=angle)
+                if _dominant_dir(new) == (1, 0):
+                    return new
+        except Exception:  # noqa: BLE001 - mejor la página sin enderezar que ninguna
+            pass
+        return self.doc[index]
+
+    def close(self):
+        if self._tmp is not None:
+            self._tmp.close()
+            self._tmp = None
 
 
 NUMBERED_HEADING = re.compile(r"^((?:[A-Z]|\d{1,2})(?:\.\d{1,3}){0,4})\.?\s+[A-ZÁÉÍÓÚ(][^\n]{2,110}$")
@@ -292,6 +346,8 @@ def _block_text(block: dict, height: float, repeated: set[str], body: float,
         raw = "".join(s["text"] for s in line["spans"])
         if not raw.strip():
             continue
+        if not re.search(r"\w", raw) and all(OCR_FONT.search(s["font"]) for s in line["spans"]):
+            continue                                      # basura de un OCR previo
         if edge and (_norm(raw) in repeated or PAGE_NUMBER.match(raw)):
             continue                                      # encabezado, pie o folio
         if lines and raw.strip() == lines[-1][1].strip():
@@ -299,6 +355,8 @@ def _block_text(block: dict, height: float, repeated: set[str], body: float,
         lines.append((_line_text(line, page, stats), raw))
         sizes.extend(s["size"] for s in line["spans"] if s["text"].strip())
     text = _clean_text("\n".join(t for t, _ in lines))
+    if text and not re.search(r"\w", text) and len(text) <= 12 and text.strip() not in ("•", "-", "*", "–", "—", "·"):
+        return ""                                         # signos sueltos: basura de OCR
     num = NUMBERED_HEADING.match(text) if text and len(text) <= 120 else None
     if num and "$" not in text:
         spans = [sp for l in block["lines"] for sp in l["spans"] if sp["text"].strip()]
@@ -306,7 +364,8 @@ def _block_text(block: dict, height: float, repeated: set[str], body: float,
         upper = sum(c.isupper() for c in text) >= .6 * max(1, sum(c.isalpha() for c in text))
         if bold or upper or (sizes and min(sizes) >= body * 1.08):
             return ("## " if num.group(1).count(".") <= 1 else "### ") + text
-    if text and sizes and len(text) <= 150 and "$" not in text:
+    if text and sizes and len(text) <= 150 and "$" not in text \
+            and len(re.findall(r"[A-Za-zÁÉÍÓÚáéíóúñÑ]", text)) >= 3:
         ratio = min(sizes) / body
         if ratio >= 1.45:
             return "## " + text
@@ -315,17 +374,80 @@ def _block_text(block: dict, height: float, repeated: set[str], body: float,
     return text
 
 
+def _ink_regions(page, texts) -> list[fitz.Rect]:
+    """Figuras dentro de un escaneo con capa de texto: zonas con tinta sin texto encima."""
+    import numpy as np
+    zoom = .5
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY, alpha=False)
+    gray = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width)
+    cell = 8
+    rows, cols = gray.shape[0] // cell, gray.shape[1] // cell
+    if rows < 4 or cols < 4:
+        return []
+    ink = (gray[:rows * cell, :cols * cell] < 190).reshape(rows, cell, cols, cell).mean(axis=(1, 3)) >= .04
+    covered = np.zeros((rows, cols), bool)
+    for box, chars in texts:
+        if chars < 20:
+            continue                                   # rótulos y basura de OCR dentro de figuras
+        x0, y0 = int(max(0, (box.x0 - 3) * zoom // cell)), int(max(0, (box.y0 - 3) * zoom // cell))
+        x1, y1 = int(min(cols, (box.x1 + 3) * zoom // cell + 1)), int(min(rows, (box.y1 + 3) * zoom // cell + 1))
+        covered[y0:y1, x0:x1] = True
+    free = ink & ~covered
+    free[:int(rows * .05)] = False
+    free[-int(rows * .05) or rows:] = False
+    free[:, :int(cols * .05)] = False
+    free[:, -int(cols * .05) or cols:] = False
+    grown = free.copy()
+    for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
+        grown |= np.roll(np.roll(free, dy, 0), dx, 1)
+    seen = np.zeros_like(grown)
+    found = []
+    for r0 in range(rows):
+        for c0 in range(cols):
+            if not grown[r0, c0] or seen[r0, c0]:
+                continue
+            stack, comp = [(r0, c0)], []
+            seen[r0, c0] = True
+            while stack:
+                r, c = stack.pop()
+                comp.append((r, c))
+                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    rr, cc = r + dr, c + dc
+                    if 0 <= rr < rows and 0 <= cc < cols and grown[rr, cc] and not seen[rr, cc]:
+                        seen[rr, cc] = True
+                        stack.append((rr, cc))
+            rs, cs = [r for r, _ in comp], [c for _, c in comp]
+            box = fitz.Rect(min(cs) * cell / zoom, min(rs) * cell / zoom,
+                            (max(cs) + 1) * cell / zoom, (max(rs) + 1) * cell / zoom)
+            filled = sum(1 for r, c in comp if free[r, c]) * (cell / zoom) ** 2
+            if box.get_area() >= .07 * page.rect.get_area() and box.width >= 110 \
+                    and box.height >= 80 and filled >= .12 * box.get_area():
+                found.append((box + (-6, -6, 6, 6)) & page.rect)
+    return found
+
+
 def _visual_regions(page, blocks=None) -> list[tuple[fitz.Rect, str]]:
     """Figuras de la página. Los fondos y marcos de recuadros de texto (ejemplos,
     derivaciones, definiciones) no son figuras: su contenido se procesa como texto."""
     area = page.rect.get_area()
     regions = []
-    for item in page.get_image_info():
-        rect = fitz.Rect(item["bbox"]) & page.rect
-        if rect.width >= 55 and rect.height >= 45 and rect.get_area() >= area * .018:
-            regions.append((rect, "image"))
     texts = [(fitz.Rect(b["bbox"]), sum(len(s["text"].strip()) for l in b["lines"] for s in l["spans"]))
              for b in (blocks or []) if b.get("lines")]
+    text_chars = sum(n for _, n in texts)
+    scan_background = False
+    mat = page.rotation_matrix
+    for item in page.get_image_info():
+        rect = (fitz.Rect(item["bbox"]) * mat) & page.rect
+        if rect.get_area() >= .7 * area and text_chars >= 200:
+            scan_background = True                    # página escaneada con texto de OCR previo
+            continue
+        if rect.width >= 55 and rect.height >= 45 and rect.get_area() >= area * .018:
+            regions.append((rect, "image"))
+    if scan_background:
+        try:
+            regions += [(r, "image") for r in _ink_regions(page, texts)]
+        except Exception:  # noqa: BLE001
+            pass
 
     def text_in(rect):
         inside = [(box, n) for box, n in texts if _inside(box, rect, .8)]
@@ -497,7 +619,12 @@ def _fix_symbol(text: str, font: str) -> str:
     return text
 
 
+OCR_FONT = re.compile(r"hidden|ocr", re.I)         # capa de texto de un OCR previo
+
+
 def _is_math_span(span) -> bool:
+    if OCR_FONT.search(span["font"]):
+        return False
     if MATH_FONT.search(span["font"]):
         return True
     return bool(ADV_FONT.search(span["font"])) and not re.search(r"[A-Za-z]{3,}", span["text"])
@@ -541,6 +668,8 @@ class LatexOCR:
         from PIL import Image
         np = self.np
         data = gray.astype(np.float32)
+        if data.size == 0:
+            return None
         lo, hi = data.min(), data.max()
         if hi - lo < 1:
             return None
@@ -662,8 +791,16 @@ def _balanced(tex: str) -> bool:
 def formula_to_latex(page, rect, spans) -> tuple[str, bool]:
     """(LaTeX, verificado). Reintenta con varias escalas y valida contra el texto del PDF."""
     engine = latex_engine()
-    if engine is None or rect.is_empty:
+    rect = fitz.Rect(rect) & page.rect
+    if engine is None or rect.is_empty or rect.width < 3 or rect.height < 3:
         return "", False
+    try:
+        return _formula_to_latex(engine, page, rect, spans)
+    except Exception:  # noqa: BLE001 - una fórmula nunca debe detener el libro
+        return "", False
+
+
+def _formula_to_latex(engine, page, rect, spans) -> tuple[str, bool]:
     import numpy as np
     size = max((s["size"] for s in spans), default=11) or 11
     src = _source_signature(spans)
@@ -705,7 +842,7 @@ def _unreliable(text: str, font: str = "") -> bool:
 def _math_line(line) -> bool:
     spans = [s for s in line["spans"] if s["text"].strip(BULLETS + " \t")]
     total = sum(len(s["text"].strip()) for s in spans)
-    if not total:
+    if not total or all(OCR_FONT.search(s["font"]) for s in spans):
         return False
     math = sum(len(s["text"].strip()) for s in spans
                if _is_math_span(s) or MATH_CHARS.search(s["text"]))
@@ -950,6 +1087,7 @@ def convert(
         if not checkpoint.exists():
             _write_checkpoint(checkpoint, signature, rows)
         check_not_scanned(doc)
+        pages = UprightPages(doc)
         info = analyze_document(doc)
         counters = {"fig": 0, "eq": 0}
         for row in rows:
@@ -958,12 +1096,16 @@ def convert(
         for index in range(len(rows), total):
             if progress:
                 progress(index, total)
-            page = doc[index]
-            row = _process_page(page, index, info, languages, label, stem, images, counters)
+            try:
+                page = pages.page(index)
+                row = _process_page(page, index, info, languages, label, stem, images, counters)
+            except Exception as exc:  # noqa: BLE001 - se conserva el texto simple de la página
+                row = _fallback_row(doc, index, exc)
             _append_checkpoint(checkpoint, row)
             rows.append(row)
     if progress:
         progress(total, total)
+    pages.close()
     result = _export(rows, source, folder, label, stem, total, max_pages)
     checkpoint.unlink(missing_ok=True)
     return result
@@ -980,7 +1122,7 @@ def _bullet_marks(page) -> list:
     except Exception:  # noqa: BLE001
         pass
     for item in page.get_image_info():
-        r = fitz.Rect(item["bbox"])
+        r = fitz.Rect(item["bbox"]) * page.rotation_matrix
         if 2 <= r.width <= 14 and 2 <= r.height <= 14:
             marks.append(r)
     return marks
@@ -1074,6 +1216,17 @@ def _group_labels(labels: list[list]) -> list[str]:
     return list(dict.fromkeys(" ".join(b[1].split()) for b in boxes))
 
 
+def _fallback_row(doc, index: int, exc: Exception) -> dict:
+    try:
+        text = _clean_text(doc[index].get_text("text"))
+    except Exception:  # noqa: BLE001
+        text = ""
+    note = f"[Página procesada en modo simple por un error: {str(exc)[:120]}]"
+    return {"page": index + 1, "text": (text + "\n\n" if text else "") + note, "figures": [],
+            "ocr": False, "ocr_error": None, "page_error": str(exc)[:200],
+            "tables": 0, "equations": 0, "eq_flagged": 0, "inline": 0}
+
+
 def _process_page(page, index, info, languages, label, stem, images, counters):
     height = page.rect.height
     blocks = [b for b in page.get_text("dict", sort=True)["blocks"] if b["type"] == 0]
@@ -1089,6 +1242,9 @@ def _process_page(page, index, info, languages, label, stem, images, counters):
     stats = {"tables": 0, "equations": 0, "eq_flagged": 0, "inline": 0}
 
     def save(clip, kind="figura"):
+        clip = fitz.Rect(clip) & page.rect
+        if clip.is_empty or clip.width < 4 or clip.height < 4:
+            return ""                                     # recorte fuera de la página
         if kind == "ecuacion":
             counters["eq"] += 1
             n, image_id = counters["eq"], f"Ecuación {counters['eq']} ({label})"
@@ -1298,5 +1454,6 @@ def _export(rows, source, folder, label, stem, total, max_pages) -> dict:
             "equations": equations, "equations_flagged": flagged, "inline_math": inline,
             "math_text": sum(r.get("math_text", 0) for r in rows),
             "figure_ocr": sum(r.get("fig_ocr", 0) for r in rows),
+            "page_errors": sum(1 for r in rows if r.get("page_error")),
             "ocr_failed": sum(1 for r in rows if r.get("ocr_error")),
             "folder": str(folder), "merged": merged, "parts": names, "visual_pdfs": visual}

@@ -116,6 +116,8 @@ class QueueWorker:
     def _summary(result: dict) -> str:
         text = (f"{result['figures']} imágenes · {result['tables']} tablas · "
                 f"{result.get('equations', 0)} ecuaciones LaTeX · {result['ocr_pages']} págs. OCR")
+        if result.get("page_errors"):
+            text += f" · {result['page_errors']} págs. en modo simple"
         if result.get("equations_flagged"):
             text += f" · {result['equations_flagged']} fórmulas por verificar"
         if result.get("ocr_failed"):

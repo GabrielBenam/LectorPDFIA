@@ -1,4 +1,4 @@
-# Lector PDF para IA — versión 0.5.0
+# Lector PDF para IA — versión 0.5.1
 
 Convierte libros PDF en texto Markdown compacto para consultarlos con Claude, Gemini, ChatGPT o NotebookLM. Todo se procesa en el equipo, sin conexión ni claves de API.
 

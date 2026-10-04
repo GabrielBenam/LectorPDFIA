@@ -1,5 +1,5 @@
 #define AppName "Lector PDF para IA"
-#define AppVersion "0.5.0"
+#define AppVersion "0.5.1"
 [Setup]
 AppId={{9350566C-7B13-497F-969C-7BF0523397A5}
 AppName={#AppName}

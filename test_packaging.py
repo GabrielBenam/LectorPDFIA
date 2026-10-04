@@ -281,3 +281,80 @@ class LayoutTest(unittest.TestCase):
             page.draw_line((120, 320 - i * 35), (420, 280 - i * 20), color=(0, 0, 1))
         res, md = self._convert(doc, "Nombre Largo De Libro")
         self.assertIn("![Imagen 1](<imagenes/Imagen 0001 (Nombre Largo De Libro).png>)", md)
+
+
+class RotatedAndScannedPagesTest(unittest.TestCase):
+    def _convert(self, doc, name="Libro", **kw):
+        tmp = Path(tempfile.mkdtemp())
+        doc.save(tmp / f"{name}.pdf")
+        res = convert(tmp / f"{name}.pdf", tmp / "out", languages="eng", checkpoint_root=tmp / "cp", **kw)
+        md = (Path(res["folder"]) / res["merged"]).read_text(encoding="utf-8")
+        return res, md.split("\n---\n", 1)[1]
+
+    def test_rotated_page_reads_in_displayed_order(self):
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        for k, word in enumerate(("Primera", "Segunda", "Tercera")):
+            page.insert_text((100 + 40 * k, 750), f"{word} linea de la pagina girada con texto suficiente",
+                             fontsize=11, rotate=90)
+        page.draw_rect(fitz.Rect(300, 100, 520, 400), color=(0, 0, 0), fill=(.9, .9, .9))
+        for i in range(6):
+            page.draw_line((310, 120 + i * 40), (500, 140 + i * 30), color=(0, 0, 1))
+        page.set_rotation(90)
+        res, md = self._convert(doc)
+        self.assertEqual(res["page_errors"], 0)
+        order = [md.index(w) for w in ("Primera", "Segunda", "Tercera")]
+        self.assertEqual(order, sorted(order))
+
+    def test_scan_background_is_not_a_figure(self):
+        shot = fitz.open()
+        sp = shot.new_page(width=600, height=800)
+        sp.insert_text((60, 100), "Texto del escaneo", fontsize=14)
+        png = sp.get_pixmap(dpi=72).tobytes("png")
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=800)
+        page.insert_image(page.rect, stream=png)
+        body = ("Este es el texto de la capa oculta de un reconocimiento previo del libro. " * 8)
+        page.insert_textbox(fitz.Rect(50, 120, 550, 700), body, fontsize=11, render_mode=3)
+        res, md = self._convert(doc)
+        self.assertEqual(res["figures"], 0)
+        self.assertNotIn("Texto en la figura", md)
+        self.assertIn("capa oculta", md)
+
+    def test_empty_or_outside_clip_never_raises(self):
+        import numpy as np
+        doc = fitz.open()
+        page = doc.new_page()
+        span = {"text": "x", "size": 11, "font": "Cmmi10", "bbox": (0, 900, 10, 910), "origin": (0, 910),
+                "flags": 0}
+        self.assertEqual(converter.formula_to_latex(page, fitz.Rect(0, 900, 50, 950), [span]), ("", False))
+        if converter.latex_engine() is not None:
+            self.assertEqual(converter.latex_engine()(np.zeros((0, 5), np.uint8)), "")
+
+    def test_page_error_falls_back_to_simple_text(self):
+        doc = fitz.open()
+        for i in range(3):
+            doc.new_page().insert_text((60, 300), f"Contenido de la pagina {i + 1} sobre el tema {'ABC'[i] * 5}")
+        real = converter._process_page
+
+        def flaky(page, index, *a, **kw):
+            if index == 1:
+                raise ValueError("zero-size array to reduction operation")
+            return real(page, index, *a, **kw)
+
+        with mock.patch.object(converter, "_process_page", side_effect=flaky):
+            res, md = self._convert(doc)
+        self.assertEqual(res["page_errors"], 1)
+        self.assertIn("Contenido de la pagina 2", md)
+        self.assertIn("modo simple", md)
+        self.assertIn("Contenido de la pagina 3", md)
+
+    def test_ocr_noise_lines_are_dropped(self):
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((60, 80), "Texto real de la pagina con palabras suficientes.", fontsize=11)
+        for k in range(4):
+            page.insert_text((300, 120 + 15 * k), "(", fontsize=11)
+        res, md = self._convert(doc)
+        self.assertIn("Texto real", md)
+        self.assertNotIn("\n\n(\n\n", md)
